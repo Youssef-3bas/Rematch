@@ -34,21 +34,26 @@ properties:
           memory: 1Gi
         probes:
           - type: Startup
-            tcpSocket:
+            httpGet:
+              path: /health/startup
               port: 8000
-            initialDelaySeconds: 2
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 60
-          - type: Liveness
-            tcpSocket:
-              port: 8000
+            initialDelaySeconds: 5
             periodSeconds: 10
-            timeoutSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 10
+          - type: Liveness
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            timeoutSeconds: 3
             failureThreshold: 3
           - type: Readiness
-            tcpSocket:
+            httpGet:
+              path: /health/ready
               port: 8000
+            initialDelaySeconds: 1
             periodSeconds: 5
-            timeoutSeconds: 2
+            timeoutSeconds: 3
             failureThreshold: 3

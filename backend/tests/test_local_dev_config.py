@@ -39,6 +39,11 @@ def test_external_auth_requires_valid_bearer_and_advertises_security(
 
     app.dependency_overrides[get_db_dep] = override_db
     with TestClient(app) as client:
+        # ACA's dedicated probes stay unauthenticated; API endpoints remain protected.
+        assert client.get("/health/startup").status_code == 200
+        assert client.get("/health/live").status_code == 200
+        assert client.get("/health/ready").status_code == 200
+
         unauthorized = client.get("/api/v1/health")
         assert unauthorized.status_code == 401
         assert unauthorized.headers["www-authenticate"] == "Bearer"

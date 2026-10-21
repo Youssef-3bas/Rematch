@@ -22,4 +22,4 @@ RUN pip install --no-cache-dir .
 USER rematch
 EXPOSE 8000
 
-CMD ["sh", "-c", "python -m alembic upgrade head && rematch-seed && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "set -eu; echo '[startup] validating required configuration'; python -c 'from app.core.config import get_settings; get_settings()' || { echo '[startup] configuration validation failed'; exit 1; }; echo '[startup] applying database migrations'; python -m alembic upgrade head || { echo '[startup] database migrations failed'; exit 1; }; echo '[startup] seeding synthetic match data'; rematch-seed || { echo '[startup] synthetic data seeding failed'; exit 1; }; echo '[startup] starting Uvicorn on 0.0.0.0:${PORT:-8000}'; exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

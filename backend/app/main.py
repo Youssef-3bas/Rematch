@@ -2,29 +2,53 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import __version__
 from app.api.router import api_router
+from app.api.routes.health import probe_router
 from app.core.config import get_settings
 from app.db.session import configure_engine, get_engine
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(application: FastAPI):
     # Reuse an engine already configured by tests/CLI; otherwise build from settings.
     from app.db import session as db_session
 
-    if db_session.engine is None:
-        configure_engine()
-    get_engine()
-    yield
+    application.state.startup_complete = False
+    try:
+        if db_session.engine is None:
+            configure_engine()
+        engine = get_engine()
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        application.state.startup_complete = True
+        logger.info("ReMatch startup checks completed; database connection is ready")
+    except Exception as exc:
+        # Log the failing phase and exception class without logging configuration values.
+        logger.error(
+            "ReMatch startup failed during database initialization (%s)",
+            type(exc).__name__,
+        )
+        raise RuntimeError(
+            "Database initialization check failed; verify database configuration "
+            "and connectivity"
+        ) from None
+    try:
+        yield
+    finally:
+        application.state.startup_complete = False
 
 
 def create_app() -> FastAPI:
@@ -106,6 +130,7 @@ def create_app() -> FastAPI:
             },
         )
 
+    application.include_router(probe_router)
     application.include_router(api_router)
     return application
 

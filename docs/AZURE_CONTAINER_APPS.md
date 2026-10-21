@@ -5,11 +5,14 @@ This guide packages the existing FastAPI backend for an Azure Container Apps Con
 ## Runtime design
 
 - `backend/Dockerfile` installs the production dependencies from `backend/pyproject.toml`, runs as a non-root user, applies Alembic migrations, seeds the deterministic synthetic fixtures, and starts Uvicorn without `--reload`.
+- The image validates its required settings before migration or seeding, emits a phase-specific startup message on failure, and binds Uvicorn to `0.0.0.0:${PORT:-8000}`. Authentication remains fail-closed when `REQUIRE_API_AUTH=true` and `API_BEARER_TOKEN` is absent or too short.
 - The app listens on `0.0.0.0:${PORT:-8000}` inside the container. The Container App ingress targets port `8000` and redirects external traffic to HTTPS.
 - `backend/containerapp.yaml` enables bearer auth, references the API token through an ACA secret, sets the Consumption workload resources to 0.5 vCPU / 1 GiB, and configures scale-to-zero (`minReplicas: 0`, `maxReplicas: 1`).
-- Probes use TCP on port 8000 because `/api/v1/health` is intentionally bearer-protected.
+- ACA uses three dedicated HTTP probes on port 8000: `/health/startup` only succeeds after lifespan initialization has established a database connection; `/health/live` reports that the ASGI process is responsive without depending on the database; `/health/ready` checks database connectivity and returns 503 when that dependency is unavailable. These platform-only routes are outside `/api/v1`; all business/API endpoints, including `/api/v1/health`, remain behind bearer authentication. The probe routes are omitted from the public OpenAPI document.
 - The SQLite database lives at `/tmp/rematch/rematch.db`. It is ephemeral and rebuilt from the deterministic synthetic seed after a new container starts. This is suitable only for the current read-only demo API; it is not durable storage for real match data or future write features.
 - No external Foundry call or new database service is introduced.
+
+The startup probe allows approximately 105 seconds after container start before failing (5-second initial delay, 10-second interval, 10 failed attempts). This covers the image's explicit configuration validation, migration, deterministic seed, and application initialization phases while still surfacing a failed command or unavailable database. Startup, liveness, and readiness remain separate signals; the liveness check does not restart the container just because the database is temporarily unavailable.
 
 ## Build and review locally
 
