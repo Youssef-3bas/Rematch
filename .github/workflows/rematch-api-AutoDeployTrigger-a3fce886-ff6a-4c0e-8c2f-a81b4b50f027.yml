@@ -59,8 +59,12 @@ jobs:
               exit 1
             fi
           done
+          REGISTRY_URL="$(printf '%s' "$REGISTRY_URL" | xargs)"
+
           if [[ "$REGISTRY_URL" != "rematchbackend.azurecr.io" ]]; then
-            echo "::error::REMATCHAPI_REGISTRY_URL must identify the existing rematchbackend ACR login server."
+            echo "::error::Registry URL mismatch."
+            printf 'Expected registry: <%s>\n' "rematchbackend.azurecr.io"
+            printf 'Received registry: <%s>\n' "$REGISTRY_URL"
             exit 1
           fi
           test -f backend/Dockerfile || { echo "::error::backend/Dockerfile is missing."; exit 1; }
