@@ -2,6 +2,16 @@
 
 This guide packages the existing FastAPI backend for an Azure Container Apps Consumption deployment. The API remains protected by its existing bearer authentication. The synthetic Phase 4 and Phase 8 datasets are migrated and seeded when a container starts; no local `.env`, database, or test data file is copied into the image.
 
+## GitHub Actions deployment
+
+The workflow at `.github/workflows/rematch-api-AutoDeployTrigger-a3fce886-ff6a-4c0e-8c2f-a81b4b50f027.yml` deploys pushes to `main`; manual runs from other branches are skipped. It checks out the triggering commit SHA, runs the backend suite and a container startup smoke check, verifies that the image's effective Uvicorn port matches ingress and all three probe ports, then builds `backend/Dockerfile` from the `backend` context with the Docker CLI. It pushes and deploys `rematchbackend.azurecr.io/rematch-api:<full-commit-sha>`; the workflow does not use the Container Apps source/Oryx builder or a floating `latest` tag.
+
+Configure the repository before using this workflow:
+
+- GitHub Actions secrets `REMATCHAPI_AZURE_CLIENT_ID`, `REMATCHAPI_AZURE_TENANT_ID`, and `REMATCHAPI_AZURE_SUBSCRIPTION_ID`, plus repository variable `REMATCHAPI_REGISTRY_URL` set to `rematchbackend.azurecr.io`. Azure Login uses GitHub OIDC; no registry username/password secrets are needed. After OIDC login, `az acr login --name rematchbackend` uses the logged-in Entra identity to execute Docker CLI login and write Docker's auth configuration; the following `docker build` and `docker push` commands use that same Docker CLI configuration. Grant the deployment identity `AcrPush` at the existing ACR resource scope, and grant only the Azure control-plane permissions it needs to inspect the existing ACR/app and update the existing Container App. `AcrPush` allows push and pull across the registry under standard RBAC. If the registry uses RBAC + ABAC repository permissions, legacy `AcrPush` is not honored; use the repository-scoped `Container Registry Repository Writer` role with a condition restricting it to `rematch-api`. Do not change the registry permission mode as part of deployment setup. The workflow checks the registry permission mode and preserves/verifies the Container App's existing pull identity with `AcrPull` under standard RBAC or `Container Registry Repository Reader` under ABAC; any existing registry password-secret reference remains untouched.
+
+The workflow fails before build/deploy if required OIDC secrets or registry URL variable, the ACR, the existing Container App, its port, or its ACR pull configuration are missing or inconsistent. It validates `backend/containerapp.yaml` but updates only the image on the existing Container App; this preserves its live secrets, authentication environment, ingress, and probes. A passing workflow confirms the built image served its startup health route through the local 8000-to-8000 mapping and that the image update command completed; Azure revision health and public authenticated API behavior still require separate post-deployment verification.
+
 ## Runtime design
 
 - `backend/Dockerfile` installs the production dependencies from `backend/pyproject.toml`, runs as a non-root user, applies Alembic migrations, seeds the deterministic synthetic fixtures, and starts Uvicorn without `--reload`.
