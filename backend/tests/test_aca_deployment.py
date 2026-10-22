@@ -7,6 +7,7 @@ from scripts.verify_aca_deployment import (
     acr_pull_role,
     build_container_template_patch,
     build_http_diagnostic,
+    build_revision_diagnostic,
     verify_pull_role,
     verify_health_response,
     verify_openapi_response,
@@ -190,6 +191,75 @@ def test_http_diagnostic_reports_status_and_redacts_credentials():
     assert "example-token" not in rendered
     assert "example-secret" not in rendered
     assert "example-password" not in rendered
+
+
+def test_revision_failure_diagnostic_reports_image_states_zero_replicas_and_logs_safely():
+    diagnostic = build_revision_diagnostic(
+        {
+            "name": "rematch-api--sha",
+            "properties": {
+                "healthState": "Unhealthy",
+                "runningState": "Stopped",
+                "runningStateDetails": "Container exited during startup",
+                "provisioningState": "Provisioned",
+                "provisioningError": {"code": "ContainerError", "message": "Startup failed"},
+                "template": {
+                    "containers": [
+                        {
+                            "name": "rematch-api",
+                            "image": "rematchbackend.azurecr.io/rematch-api:sha",
+                        }
+                    ]
+                },
+            },
+        },
+        [],
+        [
+            {
+                "Reason_s": "Unhealthy",
+                "Log_s": "Startup probe failed: connection refused",
+            }
+        ],
+        [
+            {
+                "message": "[startup] database migrations failed; API_BEARER_TOKEN=do-not-leak",
+            }
+        ],
+        "rematchbackend.azurecr.io/rematch-api:sha",
+    )
+
+    assert diagnostic["revisionName"] == "rematch-api--sha"
+    assert diagnostic["runningState"] == "Stopped"
+    assert diagnostic["healthState"] == "Unhealthy"
+    assert diagnostic["provisioningState"] == "Provisioned"
+    assert diagnostic["replicaCount"] == 0
+    assert diagnostic["containers"] == [
+        {"name": "rematch-api", "image": "rematchbackend.azurecr.io/rematch-api:sha"}
+    ]
+    rendered = str(diagnostic)
+    assert "Startup probe failed" in rendered
+    assert "database migrations failed" in rendered
+    assert "do-not-leak" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_revision_failure_diagnostic_reports_query_errors_without_raw_credentials():
+    diagnostic = build_revision_diagnostic(
+        {},
+        {},
+        {},
+        {},
+        "rematchbackend.azurecr.io/rematch-api:sha",
+        revision_query_error="request failed with Authorization: Bearer hidden-token",
+        replica_query_error="password=hidden-password",
+    )
+
+    rendered = str(diagnostic)
+    assert diagnostic["replicaCount"] is None
+    assert diagnostic["revisionQueryError"]
+    assert diagnostic["replicaQueryError"]
+    assert "hidden-token" not in rendered
+    assert "hidden-password" not in rendered
 
 
 def test_public_health_and_openapi_response_contracts():

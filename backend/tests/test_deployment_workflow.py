@@ -106,4 +106,18 @@ def test_workflow_waits_for_healthy_revision_then_checks_public_endpoints_separa
     assert "http-diagnostic" in deploy_step
     assert "--connect-timeout 10 --max-time 15" in deploy_step
     assert 'for attempt in $(seq 1 6)' in deploy_step
-    assert "Sanitized revision state" in deploy_step
+    assert "Revision failure diagnostics" in deploy_step
+
+
+def test_workflow_collects_exact_revision_replica_and_failure_logs_before_failing():
+    deploy_start = WORKFLOW.index("- name: Deploy the exact pushed image and normalize the app container name")
+    deploy_step = WORKFLOW[deploy_start:]
+    failure_diagnostic = deploy_step[deploy_step.index('if [[ "$revision_ready" != true ]]'):]
+
+    assert 'az containerapp revision show --name rematch-api --resource-group Rematch-RG --revision "$latest_revision"' in failure_diagnostic
+    assert 'az containerapp replica list --name rematch-api --resource-group Rematch-RG --revision "$latest_revision"' in failure_diagnostic
+    assert 'az containerapp logs show --name rematch-api --resource-group Rematch-RG --type system --revision "$latest_revision"' in failure_diagnostic
+    assert 'az containerapp logs show --name rematch-api --resource-group Rematch-RG --type console --revision "$latest_revision" --container rematch-api' in failure_diagnostic
+    assert 'verify_aca_deployment.py revision-diagnostic' in failure_diagnostic
+    assert '--image "$IMAGE"' in failure_diagnostic
+    assert 'sensitive values redacted' in failure_diagnostic
