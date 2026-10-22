@@ -59,8 +59,12 @@ jobs:
               exit 1
             fi
           done
+          REGISTRY_URL="$(printf '%s' "$REGISTRY_URL" | xargs)"
+
           if [[ "$REGISTRY_URL" != "rematchbackend.azurecr.io" ]]; then
-            echo "::error::REMATCHAPI_REGISTRY_URL must identify the existing rematchbackend ACR login server."
+            echo "::error::Registry URL mismatch."
+            printf 'Expected registry: <%s>\n' "rematchbackend.azurecr.io"
+            printf 'Received registry: <%s>\n' "$REGISTRY_URL"
             exit 1
           fi
           test -f backend/Dockerfile || { echo "::error::backend/Dockerfile is missing."; exit 1; }
@@ -98,6 +102,23 @@ jobs:
           client-id: ${{ secrets.REMATCHAPI_AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.REMATCHAPI_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.REMATCHAPI_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Diagnose Azure login context
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Active Azure account ==="
+          az account show \
+            --query "{subscriptionName:name, subscriptionId:id, tenantId:tenantId, userType:user.type}" \
+            --output json
+          echo "=== Locate registry in active subscription ==="
+          az acr list \
+            --query "[?name=='rematchbackend'].{name:name,resourceGroup:resourceGroup,loginServer:loginServer}" \
+            --output json
+          echo "=== Check expected resource group ==="
+          az group show --name Rematch-RG \
+            --query "{name:name,location:location}" \
+            --output json
 
       - name: Install the Azure Container Apps CLI extension
         run: az extension add --name containerapp --upgrade --only-show-errors
