@@ -24,7 +24,9 @@ def test_acr_push_uses_oidc_backed_azure_cli_docker_authentication():
 
 
 def test_workflow_uses_configured_registry_and_commit_tag_for_existing_app():
-    assert "${{ vars.REMATCHAPI_REGISTRY_URL }}/rematch-api:${{ github.sha }}" in WORKFLOW
+    assert 'printf \'REGISTRY_URL=%s\\n\' "$REGISTRY_URL" >> "$GITHUB_ENV"' in WORKFLOW
+    assert 'printf \'IMAGE=%s/rematch-api:%s\\n\' "$REGISTRY_URL" "$EXPECTED_SHA" >> "$GITHUB_ENV"' in WORKFLOW
+    assert "${{ vars.REMATCHAPI_REGISTRY_URL }}/rematch-api:${{ github.sha }}" not in WORKFLOW
     assert 'if [[ "$REGISTRY_URL" != "rematchbackend.azurecr.io" ]]' in WORKFLOW
     assert "--name rematch-api" in WORKFLOW
     assert "--resource-group Rematch-RG" in WORKFLOW

@@ -20,7 +20,6 @@ jobs:
 
     env:
       REGISTRY_URL: ${{ vars.REMATCHAPI_REGISTRY_URL }}
-      IMAGE: ${{ vars.REMATCHAPI_REGISTRY_URL }}/rematch-api:${{ github.sha }}
 
     steps:
       - name: Checkout the triggering commit
@@ -60,6 +59,8 @@ jobs:
             fi
           done
           REGISTRY_URL="$(printf '%s' "$REGISTRY_URL" | xargs)"
+          printf 'REGISTRY_URL=%s\n' "$REGISTRY_URL" >> "$GITHUB_ENV"
+          printf 'IMAGE=%s/rematch-api:%s\n' "$REGISTRY_URL" "$EXPECTED_SHA" >> "$GITHUB_ENV"
 
           if [[ "$REGISTRY_URL" != "rematchbackend.azurecr.io" ]]; then
             echo "::error::Registry URL mismatch."
@@ -167,8 +168,6 @@ jobs:
 
       - name: Build and push backend Docker image for this commit
         shell: bash
-        env:
-          IMAGE: ${{ env.IMAGE }}
         run: |
           set -euo pipefail
           expected_image="${REGISTRY_URL}/rematch-api:${GITHUB_SHA}"
@@ -227,7 +226,6 @@ jobs:
       - name: Deploy the exact pushed image and normalize the app container name
         shell: bash
         env:
-          IMAGE: ${{ env.IMAGE }}
           EXPECTED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
