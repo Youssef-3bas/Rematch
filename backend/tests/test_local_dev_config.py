@@ -59,7 +59,11 @@ def test_external_auth_requires_valid_bearer_and_advertises_security(
         )
         assert authorized.status_code == 200
 
-        schema = client.get("/openapi.json").json()
+        openapi_response = client.get("/openapi.json")
+        assert openapi_response.status_code == 200
+        assert openapi_response.headers["content-type"].startswith("application/json")
+        schema = openapi_response.json()
+        assert isinstance(schema.get("openapi"), str)
         assert schema["components"]["securitySchemes"]["BearerAuth"] == {
             "type": "apiKey",
             "description": "Bearer token configured on the ReMatch API server.",
