@@ -73,3 +73,17 @@ def test_workflow_preserves_live_settings_and_verifies_revision_and_public_auth(
     assert '"https://${fqdn}/openapi.json"' in WORKFLOW
     assert '"https://${fqdn}/api/v1/health"' in WORKFLOW
     assert "HTTP 401 with a Bearer challenge" in WORKFLOW
+
+
+def test_workflow_submits_sanitized_live_container_payload_for_exact_target_and_sha():
+    deploy_start = WORKFLOW.index("- name: Deploy the exact pushed image and normalize the app container name")
+    deploy_step = WORKFLOW[deploy_start:]
+
+    assert 'expected_image="${REGISTRY_URL}/rematch-api:$EXPECTED_SHA"' in deploy_step
+    assert 'if [[ "$IMAGE" != "$expected_image" ]]' in deploy_step
+    assert "--name rematch-api --resource-group Rematch-RG --output json" in deploy_step
+    assert 'az containerapp show --name rematch-api --resource-group Rematch-RG --output json' in deploy_step
+    assert "verify_aca_deployment.py template-patch \"$app_json\" --image \"$IMAGE\"" in deploy_step
+    assert '--uri "https://management.azure.com${app_id}?api-version=2025-07-01"' in deploy_step
+    assert '--body "@$patch_json"' in deploy_step
+    assert "imageType" not in deploy_step

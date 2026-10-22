@@ -28,6 +28,9 @@ def app_document(container_name="bootstrap-container-pre-deployment"):
                     {
                         "name": container_name,
                         "image": "mcr.microsoft.com/k8se/quickstart:latest",
+                        # Present in some `az containerapp show` responses, but
+                        # unsupported by the Container Apps PATCH body schema.
+                        "imageType": "ContainerImage",
                         "env": [{"name": "API_BEARER_TOKEN", "secretRef": "api-bearer-token"}],
                         "probes": [{"type": "Startup", "httpGet": {"path": "/health/startup", "port": 8000}}],
                         "resources": {"cpu": 0.5, "memory": "1Gi"},
@@ -106,6 +109,7 @@ def test_bootstrap_template_patch_renames_only_container_and_preserves_live_sett
     assert "configuration" not in patch["properties"]
     assert patched["name"] == "rematch-api"
     assert patched["image"] == "rematchbackend.azurecr.io/rematch-api:abc123"
+    assert "imageType" not in patched
     assert patched["env"] == original["env"]
     assert patched["probes"] == original["probes"]
     assert patched["resources"] == original["resources"]
@@ -113,6 +117,28 @@ def test_bootstrap_template_patch_renames_only_container_and_preserves_live_sett
     assert live["properties"]["configuration"] == original_configuration
     assert live["identity"] == original_identity
     assert live["properties"]["template"]["scale"] == {"minReplicas": 0, "maxReplicas": 1}
+
+
+def test_template_patch_removes_image_type_from_every_submitted_container():
+    live = app_document(container_name="rematch-api")
+    live["properties"]["template"]["containers"].append(
+        {"name": "sidecar", "image": "example/sidecar:stable", "imageType": "ContainerImage"}
+    )
+
+    patch = build_container_template_patch(
+        live,
+        "rematchbackend.azurecr.io/rematch-api:79d0f8033121a49943e49b4204b93c2b59f5618",
+    )
+
+    submitted = patch["properties"]["template"]["containers"]
+    assert all("imageType" not in container for container in submitted)
+    api_container = next(container for container in submitted if container["name"] == "rematch-api")
+    assert api_container["image"] == (
+        "rematchbackend.azurecr.io/rematch-api:79d0f8033121a49943e49b4204b93c2b59f5618"
+    )
+    assert api_container["env"] == live["properties"]["template"]["containers"][0]["env"]
+    assert api_container["probes"] == live["properties"]["template"]["containers"][0]["probes"]
+    assert api_container["resources"] == live["properties"]["template"]["containers"][0]["resources"]
 
 
 def test_template_patch_refuses_wrong_port_or_ambiguous_containers():

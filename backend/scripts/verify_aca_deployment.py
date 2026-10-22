@@ -115,6 +115,11 @@ def build_container_template_patch(document: dict[str, Any], image: str) -> dict
         raise DeploymentValidationError("Existing Container App ingress targetPort must be 8000.")
 
     containers = deepcopy(_containers(document))
+    # `az containerapp show` may include the read-only `imageType` field on
+    # container objects. It is not accepted by the Container Apps PATCH
+    # request schema, so omit it from every container in the outgoing template.
+    for container in containers:
+        container.pop("imageType", None)
     named = [container for container in containers if container.get("name") == "rematch-api"]
     if len(named) == 1:
         target = named[0]
