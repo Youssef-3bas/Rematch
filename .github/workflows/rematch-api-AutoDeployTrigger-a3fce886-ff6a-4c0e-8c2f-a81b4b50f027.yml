@@ -20,7 +20,6 @@ jobs:
 
     env:
       REGISTRY_URL: ${{ vars.REMATCHAPI_REGISTRY_URL }}
-      IMAGE: ${{ vars.REMATCHAPI_REGISTRY_URL }}/rematch-api:${{ github.sha }}
 
     steps:
       - name: Checkout the triggering commit
@@ -60,6 +59,8 @@ jobs:
             fi
           done
           REGISTRY_URL="$(printf '%s' "$REGISTRY_URL" | xargs)"
+          printf 'REGISTRY_URL=%s\n' "$REGISTRY_URL" >> "$GITHUB_ENV"
+          printf 'IMAGE=%s/rematch-api:%s\n' "$REGISTRY_URL" "$EXPECTED_SHA" >> "$GITHUB_ENV"
 
           if [[ "$REGISTRY_URL" != "rematchbackend.azurecr.io" ]]; then
             echo "::error::Registry URL mismatch."
@@ -102,7 +103,7 @@ jobs:
           client-id: ${{ secrets.REMATCHAPI_AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.REMATCHAPI_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.REMATCHAPI_AZURE_SUBSCRIPTION_ID }}
-          
+
       - name: Diagnose Azure login context
         shell: bash
         run: |
@@ -119,33 +120,32 @@ jobs:
           az group show --name Rematch-RG \
             --query "{name:name,location:location}" \
             --output json
-            
+
       - name: Install the Azure Container Apps CLI extension
         run: az extension add --name containerapp --upgrade --only-show-errors
 
-      - name: Verify existing ACR and Container App configuration
+      - name: Verify existing resource group, ACR, and Container App ingress
         shell: bash
         run: |
           set -euo pipefail
           expected_registry="$REGISTRY_URL"
+          az group show --name Rematch-RG --output none --only-show-errors || {
+            echo "::error::Existing resource group Rematch-RG was not found or is not readable."
+            exit 1
+          }
           acr_server="$(az acr show --name rematchbackend --query loginServer --output tsv --only-show-errors)" || {
             echo "::error::Azure Container Registry rematchbackend is unavailable to this Azure identity."
             exit 1
           }
           if [[ "$acr_server" != "$expected_registry" ]]; then
-            echo "::error::ACR login server does not match the required image registry."
+            echo "::error::The configured registry URL does not match the existing ACR login server."
             exit 1
           fi
           acr_id="$(az acr show --name rematchbackend --query id --output tsv --only-show-errors)"
-          registry_role_mode="$(az acr show --name rematchbackend --query roleAssignmentMode --output tsv --only-show-errors)"
-          case "${registry_role_mode,,}" in
-            ""|rbac|legacyregistrypermissions) pull_role="AcrPull" ;;
-            rbac-abac|abacrepositorypermissions) pull_role="Container Registry Repository Reader" ;;
-            *)
-              echo "::error::The ACR reports an unrecognized role-assignment mode; refusing to assume pull permissions."
-              exit 1
-              ;;
-          esac
+          acr_json="$(mktemp)"
+          trap 'rm -f "$acr_json"' EXIT
+          az acr show --name rematchbackend --output json --only-show-errors > "$acr_json"
+          pull_role="$(python backend/scripts/verify_aca_deployment.py acr-role "$acr_json")" || exit 1
           app_id="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query id --output tsv --only-show-errors)" || {
             echo "::error::Existing Container App rematch-api in Rematch-RG was not found or is not readable."
             exit 1
@@ -153,8 +153,6 @@ jobs:
           app_name="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query name --output tsv --only-show-errors)"
           app_group="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query resourceGroup --output tsv --only-show-errors)"
           target_port="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query properties.configuration.ingress.targetPort --output tsv --only-show-errors)"
-          registry_identity="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query "properties.configuration.registries[?server=='$expected_registry'] | [0].identity" --output tsv --only-show-errors)"
-          registry_password_ref="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query "properties.configuration.registries[?server=='$expected_registry'] | [0].passwordSecretRef" --output tsv --only-show-errors)"
           if [[ "$app_name" != "rematch-api" || "$app_group" != "Rematch-RG" ]]; then
             echo "::error::Azure returned a different Container App or resource group than configured."
             exit 1
@@ -163,43 +161,13 @@ jobs:
             echo "::error::Existing Container App ingress targetPort must be 8000; refusing to deploy."
             exit 1
           fi
-          if [[ -z "$registry_identity" && -z "$registry_password_ref" ]]; then
-            echo "::error::Container App has no pull identity or password secret reference for rematchbackend.azurecr.io."
-            exit 1
-          fi
-          if [[ "$registry_identity" == "system" ]]; then
-            pull_principal="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query identity.principalId --output tsv --only-show-errors)"
-          elif [[ -n "$registry_identity" ]]; then
-            pull_principal="$(az identity show --ids "$registry_identity" --query principalId --output tsv --only-show-errors)" || {
-              echo "::error::Configured Container App registry identity could not be resolved."
-              exit 1
-            }
-          else
-            pull_principal=""
-          fi
-          if [[ -n "$registry_identity" && -z "$pull_principal" ]]; then
-            echo "::error::Configured Container App registry identity has no principal ID."
-            exit 1
-          fi
-          if [[ -n "$pull_principal" ]]; then
-            acr_pull_roles="$(az role assignment list --scope "$acr_id" --include-inherited --query "[?principalId=='$pull_principal' && roleDefinitionName=='$pull_role'].roleDefinitionName" --output tsv --only-show-errors)" || {
-              echo "::error::Unable to verify the image-pull role for the Container App identity."
-              exit 1
-            }
-            if [[ "$acr_pull_roles" != *"$pull_role"* ]]; then
-              echo "::error::The Container App identity lacks the pull role required by this ACR authorization mode."
-              exit 1
-            fi
-          fi
-          echo "Existing ACR, Container App, ingress port, and image-pull configuration verified."
+          echo "Existing resource group, ACR authorization mode ($pull_role), Container App, and ingress port verified."
 
       - name: Authenticate Docker to ACR with the Azure OIDC identity
         run: az acr login --name rematchbackend --only-show-errors
 
       - name: Build and push backend Docker image for this commit
         shell: bash
-        env:
-          IMAGE: ${{ env.IMAGE }}
         run: |
           set -euo pipefail
           expected_image="${REGISTRY_URL}/rematch-api:${GITHUB_SHA}"
@@ -213,10 +181,51 @@ jobs:
             exit 1
           fi
 
-      - name: Deploy the exact pushed image to the existing Container App
+      - name: Configure and verify Container App ACR managed identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Configure before validating: the previous workflow only checked for
+          # credentials and failed before ever creating the identity binding.
+          az containerapp identity assign \
+            --name rematch-api \
+            --resource-group Rematch-RG \
+            --system-assigned \
+            --output none \
+            --only-show-errors
+          az containerapp registry set \
+            --name rematch-api \
+            --resource-group Rematch-RG \
+            --server "$REGISTRY_URL" \
+            --identity system \
+            --only-show-errors >/dev/null
+
+          acr_json="$(mktemp)"
+          app_json="$(mktemp)"
+          roles_json="$(mktemp)"
+          trap 'rm -f "$acr_json" "$app_json" "$roles_json"' EXIT
+          az acr show --name rematchbackend --output json --only-show-errors > "$acr_json"
+          pull_role="$(python backend/scripts/verify_aca_deployment.py acr-role "$acr_json")" || exit 1
+          az containerapp show --name rematch-api --resource-group Rematch-RG --output json --only-show-errors > "$app_json"
+          pull_principal="$(python backend/scripts/verify_aca_deployment.py verify-registry "$app_json" --server "$REGISTRY_URL")" || {
+            echo "::error::The live Container App registry configuration does not use its system-assigned identity."
+            exit 1
+          }
+          acr_id="$(az acr show --name rematchbackend --query id --output tsv --only-show-errors)"
+          az role assignment list --scope "$acr_id" --include-inherited --output json --only-show-errors > "$roles_json" || {
+            echo "::error::Unable to inspect image-pull role assignments on the existing ACR."
+            exit 1
+          }
+          python backend/scripts/verify_aca_deployment.py verify-role "$roles_json" \
+            --principal-id "$pull_principal" --role-name "$pull_role" || {
+              echo "::error::Assign $pull_role to the Container App system identity at the existing ACR scope, then rerun."
+              exit 1
+            }
+          echo "Container App system identity, ACR registry binding, and pull role verified."
+
+      - name: Deploy the exact pushed image and normalize the app container name
         shell: bash
         env:
-          IMAGE: ${{ env.IMAGE }}
           EXPECTED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -225,17 +234,80 @@ jobs:
             echo "::error::Deployment image does not match the triggering commit SHA."
             exit 1
           fi
-          az containerapp update \
-            --name rematch-api \
-            --resource-group Rematch-RG \
-            --image "$IMAGE" \
-            --output none \
-            --only-show-errors
-          deployed_image="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query "properties.template.containers[?name=='rematch-api'] | [0].image" --output tsv --only-show-errors)"
-          if [[ "$deployed_image" != "$expected_image" ]]; then
-            echo "::error::Container App image does not match the pushed commit image."
+          if ! az acr repository show-tags --name rematchbackend --repository rematch-api --output tsv --only-show-errors | grep -Fxq "$EXPECTED_SHA"; then
+            echo "::error::The exact commit image tag was not found in the existing ACR after push."
             exit 1
           fi
-          echo "The existing Container App now references the image built from $EXPECTED_SHA. Revision health and public API behavior still need verification."
 
+          app_json="$(mktemp)"
+          patch_json="$(mktemp)"
+          trap 'rm -f "$app_json" "$patch_json"' EXIT
+          az containerapp show --name rematch-api --resource-group Rematch-RG --output json --only-show-errors > "$app_json"
+          previous_revision="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query properties.latestRevisionName --output tsv --only-show-errors)"
+          app_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["id"])' "$app_json")"
+          python backend/scripts/verify_aca_deployment.py template-patch "$app_json" --image "$IMAGE" --output "$patch_json"
+          # Merge-patch only the current container array. Existing env, probes,
+          # resources, secrets, ingress, and app-scope configuration stay intact.
+          az rest --method patch \
+            --uri "https://management.azure.com${app_id}?api-version=2025-07-01" \
+            --headers Content-Type=application/merge-patch+json \
+            --body "@$patch_json" \
+            --output none \
+            --only-show-errors
 
+          latest_revision=""
+          for attempt in $(seq 1 60); do
+            latest_revision="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query properties.latestRevisionName --output tsv --only-show-errors)"
+            if [[ -n "$latest_revision" && "$latest_revision" != "None" && "$latest_revision" != "$previous_revision" ]]; then break; fi
+            sleep 5
+          done
+          if [[ -z "$latest_revision" || "$latest_revision" == "None" || "$latest_revision" == "$previous_revision" ]]; then
+            echo "::error::Azure did not create a new latest revision after the image update."
+            exit 1
+          fi
+
+          fqdn="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query properties.configuration.ingress.fqdn --output tsv --only-show-errors)"
+          if [[ -z "$fqdn" || "$fqdn" == "None" ]]; then
+            echo "::error::The existing Container App has no public ingress FQDN to smoke-test."
+            exit 1
+          fi
+          response_file="$(mktemp)"
+          headers_file="$(mktemp)"
+          trap 'rm -f "$app_json" "$patch_json" "$response_file" "$headers_file"' EXIT
+          openapi_status=""
+          health_status=""
+          for attempt in $(seq 1 36); do
+            openapi_status="$(curl --silent --show-error --max-time 15 --output "$response_file" --write-out '%{http_code}' "https://${fqdn}/openapi.json" || true)"
+            if [[ "$openapi_status" == "200" ]]; then break; fi
+            sleep 5
+          done
+          if [[ "$openapi_status" != "200" ]]; then
+            echo "::error::The public OpenAPI endpoint did not return HTTP 200 after deployment."
+            exit 1
+          fi
+          for attempt in $(seq 1 36); do
+            health_status="$(curl --silent --show-error --max-time 15 --dump-header "$headers_file" --output "$response_file" --write-out '%{http_code}' "https://${fqdn}/api/v1/health" || true)"
+            if [[ "$health_status" == "401" ]] && grep --ignore-case --quiet '^www-authenticate:[[:space:]]*Bearer' "$headers_file"; then break; fi
+            sleep 5
+          done
+          if [[ "$health_status" != "401" ]] || ! grep --ignore-case --quiet '^www-authenticate:[[:space:]]*Bearer' "$headers_file"; then
+            echo "::error::Unauthenticated public API health did not return HTTP 401 with a Bearer challenge."
+            exit 1
+          fi
+
+          revision_json="$(mktemp)"
+          trap 'rm -f "$app_json" "$patch_json" "$response_file" "$headers_file" "$revision_json"' EXIT
+          revision_ready=false
+          for attempt in $(seq 1 60); do
+            az containerapp revision show --name rematch-api --resource-group Rematch-RG --revision "$latest_revision" --output json --only-show-errors > "$revision_json"
+            if python backend/scripts/verify_aca_deployment.py verify-revision "$revision_json" --image "$IMAGE"; then
+              revision_ready=true
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$revision_ready" != true ]]; then
+            echo "::error::Latest revision did not become Healthy, Running, and Provisioned with the exact SHA image."
+            exit 1
+          fi
+          echo "Latest revision uses the exact SHA image, is healthy, serves public OpenAPI, and keeps API bearer auth enforced."
