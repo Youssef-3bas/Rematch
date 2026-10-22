@@ -96,16 +96,22 @@ def test_pull_role_must_match_principal_and_role():
 def test_bootstrap_template_patch_renames_only_container_and_preserves_live_settings():
     live = app_document()
     original = deepcopy(live["properties"]["template"]["containers"][0])
+    original_configuration = deepcopy(live["properties"]["configuration"])
+    original_identity = deepcopy(live["identity"])
     patch = build_container_template_patch(live, "rematchbackend.azurecr.io/rematch-api:abc123")
     patched = patch["properties"]["template"]["containers"][0]
     assert patch["location"] == "eastus"
+    assert "identity" not in patch
     assert set(patch["properties"]) == {"template"}
+    assert "configuration" not in patch["properties"]
     assert patched["name"] == "rematch-api"
     assert patched["image"] == "rematchbackend.azurecr.io/rematch-api:abc123"
     assert patched["env"] == original["env"]
     assert patched["probes"] == original["probes"]
     assert patched["resources"] == original["resources"]
     assert set(patch["properties"]["template"]) == {"containers"}
+    assert live["properties"]["configuration"] == original_configuration
+    assert live["identity"] == original_identity
     assert live["properties"]["template"]["scale"] == {"minReplicas": 0, "maxReplicas": 1}
 
 

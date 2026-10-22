@@ -53,7 +53,21 @@ def test_workflow_preserves_live_settings_and_verifies_revision_and_public_auth(
     assert "verify_aca_deployment.py template-patch" in WORKFLOW
     assert "az rest --method patch" in WORKFLOW
     assert 'https://management.azure.com${app_id}?api-version=2025-07-01' in WORKFLOW
-    assert "Content-Type=application/merge-patch+json" in WORKFLOW
+    assert (
+        'az containerapp show --name rematch-api --resource-group Rematch-RG --output json'
+        in WORKFLOW
+    )
+    assert '"$app_json"' in WORKFLOW
+    assert "Content-Type=application/json" in WORKFLOW
+    assert "Content-Type=application/merge-patch+json" not in WORKFLOW
+    assert '--body "@$patch_json"' in WORKFLOW
+    assert 'if ! az rest --method patch' in WORKFLOW
+    assert '2>"$update_error"' in WORKFLOW
+    assert 'error_code="$(python -c ' in WORKFLOW
+    assert "response details were withheld" in WORKFLOW
+    assert WORKFLOW.index(
+        'python backend/scripts/verify_aca_deployment.py template-patch'
+    ) < WORKFLOW.index('if ! az rest --method patch')
     assert "az containerapp revision show" in WORKFLOW
     assert "verify_aca_deployment.py verify-revision" in WORKFLOW
     assert '"https://${fqdn}/openapi.json"' in WORKFLOW

@@ -241,19 +241,24 @@ jobs:
 
           app_json="$(mktemp)"
           patch_json="$(mktemp)"
-          trap 'rm -f "$app_json" "$patch_json"' EXIT
+          update_error="$(mktemp)"
+          trap 'rm -f "$app_json" "$patch_json" "$update_error"' EXIT
           az containerapp show --name rematch-api --resource-group Rematch-RG --output json --only-show-errors > "$app_json"
           previous_revision="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query properties.latestRevisionName --output tsv --only-show-errors)"
           app_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["id"])' "$app_json")"
           python backend/scripts/verify_aca_deployment.py template-patch "$app_json" --image "$IMAGE" --output "$patch_json"
-          # Merge-patch only the current container array. Existing env, probes,
-          # resources, secrets, ingress, and app-scope configuration stay intact.
-          az rest --method patch \
+          # Azure's Container Apps PATCH endpoint accepts application/json and
+          # applies the partial template update without replacing app config.
+          if ! az rest --method patch \
             --uri "https://management.azure.com${app_id}?api-version=2025-07-01" \
-            --headers Content-Type=application/merge-patch+json \
+            --headers Content-Type=application/json \
             --body "@$patch_json" \
             --output none \
-            --only-show-errors
+            --only-show-errors 2>"$update_error"; then
+            error_code="$(python -c 'import re,sys; text=open(sys.argv[1], encoding="utf-8", errors="replace").read(); match=re.search(r"\(([A-Za-z][A-Za-z0-9_-]{0,63})\)", text); print(match.group(1) if match else "unavailable")' "$update_error")"
+            echo "::error::Azure rejected the Container App update (error code: ${error_code}). Review the Azure Activity Log for rematch-api in Rematch-RG; response details were withheld."
+            exit 1
+          fi
 
           latest_revision=""
           for attempt in $(seq 1 60); do
@@ -273,7 +278,7 @@ jobs:
           fi
           response_file="$(mktemp)"
           headers_file="$(mktemp)"
-          trap 'rm -f "$app_json" "$patch_json" "$response_file" "$headers_file"' EXIT
+          trap 'rm -f "$app_json" "$patch_json" "$update_error" "$response_file" "$headers_file"' EXIT
           openapi_status=""
           health_status=""
           for attempt in $(seq 1 36); do
@@ -296,7 +301,7 @@ jobs:
           fi
 
           revision_json="$(mktemp)"
-          trap 'rm -f "$app_json" "$patch_json" "$response_file" "$headers_file" "$revision_json"' EXIT
+          trap 'rm -f "$app_json" "$patch_json" "$update_error" "$response_file" "$headers_file" "$revision_json"' EXIT
           revision_ready=false
           for attempt in $(seq 1 60); do
             az containerapp revision show --name rematch-api --resource-group Rematch-RG --revision "$latest_revision" --output json --only-show-errors > "$revision_json"
