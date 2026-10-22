@@ -15,7 +15,7 @@ properties:
       maxReplicas: 1
     containers:
       - name: rematch-api
-        image: REPLACE_WITH_REGISTRY/rematch-backend:REPLACE_WITH_TAG
+        image: rematchbackend.azurecr.io/rematch-api:REPLACE_WITH_TAG
         env:
           - name: APP_ENV
             value: production
