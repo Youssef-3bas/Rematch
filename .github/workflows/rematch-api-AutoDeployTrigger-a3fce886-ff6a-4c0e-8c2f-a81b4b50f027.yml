@@ -271,37 +271,8 @@ jobs:
             exit 1
           fi
 
-          fqdn="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query properties.configuration.ingress.fqdn --output tsv --only-show-errors)"
-          if [[ -z "$fqdn" || "$fqdn" == "None" ]]; then
-            echo "::error::The existing Container App has no public ingress FQDN to smoke-test."
-            exit 1
-          fi
-          response_file="$(mktemp)"
-          headers_file="$(mktemp)"
-          trap 'rm -f "$app_json" "$patch_json" "$update_error" "$response_file" "$headers_file"' EXIT
-          openapi_status=""
-          health_status=""
-          for attempt in $(seq 1 36); do
-            openapi_status="$(curl --silent --show-error --max-time 15 --output "$response_file" --write-out '%{http_code}' "https://${fqdn}/openapi.json" || true)"
-            if [[ "$openapi_status" == "200" ]]; then break; fi
-            sleep 5
-          done
-          if [[ "$openapi_status" != "200" ]]; then
-            echo "::error::The public OpenAPI endpoint did not return HTTP 200 after deployment."
-            exit 1
-          fi
-          for attempt in $(seq 1 36); do
-            health_status="$(curl --silent --show-error --max-time 15 --dump-header "$headers_file" --output "$response_file" --write-out '%{http_code}' "https://${fqdn}/api/v1/health" || true)"
-            if [[ "$health_status" == "401" ]] && grep --ignore-case --quiet '^www-authenticate:[[:space:]]*Bearer' "$headers_file"; then break; fi
-            sleep 5
-          done
-          if [[ "$health_status" != "401" ]] || ! grep --ignore-case --quiet '^www-authenticate:[[:space:]]*Bearer' "$headers_file"; then
-            echo "::error::Unauthenticated public API health did not return HTTP 401 with a Bearer challenge."
-            exit 1
-          fi
-
           revision_json="$(mktemp)"
-          trap 'rm -f "$app_json" "$patch_json" "$update_error" "$response_file" "$headers_file" "$revision_json"' EXIT
+          trap 'rm -f "$app_json" "$patch_json" "$update_error" "$revision_json"' EXIT
           revision_ready=false
           for attempt in $(seq 1 60); do
             az containerapp revision show --name rematch-api --resource-group Rematch-RG --revision "$latest_revision" --output json --only-show-errors > "$revision_json"
@@ -312,7 +283,76 @@ jobs:
             sleep 10
           done
           if [[ "$revision_ready" != true ]]; then
-            echo "::error::Latest revision did not become Healthy, Running, and Provisioned with the exact SHA image."
+            revision_state="$(az containerapp revision show --name rematch-api --resource-group Rematch-RG --revision "$latest_revision" --query '{name:name,healthState:properties.healthState,runningState:properties.runningState,provisioningState:properties.provisioningState,containers:properties.template.containers[].{name:name,image:image}}' --output json --only-show-errors 2>/dev/null || echo '{}')"
+            echo "::error::Latest revision did not become Healthy, Running, and Provisioned with the exact SHA image. Sanitized revision state: ${revision_state}"
             exit 1
           fi
-          echo "Latest revision uses the exact SHA image, is healthy, serves public OpenAPI, and keeps API bearer auth enforced."
+          echo "Verified revision ${latest_revision}: healthy, running, provisioned, and using the expected SHA image."
+
+          fqdn="$(az containerapp show --name rematch-api --resource-group Rematch-RG --query properties.configuration.ingress.fqdn --output tsv --only-show-errors)"
+          if [[ -z "$fqdn" || "$fqdn" == "None" ]]; then
+            echo "::error::The existing Container App has no public ingress FQDN to smoke-test."
+            exit 1
+          fi
+          response_file="$(mktemp)"
+          headers_file="$(mktemp)"
+          request_error="$(mktemp)"
+          trap 'rm -f "$app_json" "$patch_json" "$update_error" "$revision_json" "$response_file" "$headers_file" "$request_error"' EXIT
+
+          request_status() {
+            local url="$1"
+            : > "$response_file"
+            : > "$request_error"
+            : > "$headers_file"
+            curl --silent --show-error --connect-timeout 10 --max-time 15 \
+              --dump-header "$headers_file" --output "$response_file" \
+              --write-out '%{http_code}' "$url" 2>"$request_error" || true
+          }
+          report_http_failure() {
+            local label="$1"
+            local response_status="$2"
+            local diagnostic
+            diagnostic="$(python backend/scripts/verify_aca_deployment.py http-diagnostic \
+              "$response_status" "$response_file" "$request_error")"
+            echo "::error::${label} failed after bounded retries: ${diagnostic}"
+          }
+
+          for probe in live ready; do
+            if [[ "$probe" == "live" ]]; then expected_check="liveness"; else expected_check="readiness"; fi
+            probe_status=""
+            for attempt in $(seq 1 6); do
+              probe_status="$(request_status "https://${fqdn}/health/${probe}")"
+              if [[ "$probe_status" == "200" ]] && python backend/scripts/verify_aca_deployment.py verify-health-response "$response_file" --check "$expected_check"; then break; fi
+              sleep 5
+            done
+            if [[ "$probe_status" != "200" ]] || ! python backend/scripts/verify_aca_deployment.py verify-health-response "$response_file" --check "$expected_check"; then
+              report_http_failure "Public /health/${probe} check" "$probe_status"
+              exit 1
+            fi
+            echo "Public /health/${probe} returned HTTP 200 with the expected ${expected_check} response."
+          done
+
+          openapi_status=""
+          for attempt in $(seq 1 6); do
+            openapi_status="$(request_status "https://${fqdn}/openapi.json")"
+            if [[ "$openapi_status" == "200" ]] && python backend/scripts/verify_aca_deployment.py verify-openapi-response "$response_file"; then break; fi
+            sleep 5
+          done
+          if [[ "$openapi_status" != "200" ]] || ! python backend/scripts/verify_aca_deployment.py verify-openapi-response "$response_file"; then
+            report_http_failure "Public /openapi.json check" "$openapi_status"
+            exit 1
+          fi
+          echo "Public /openapi.json returned HTTP 200 with a valid OpenAPI document."
+
+          auth_status=""
+          for attempt in $(seq 1 6); do
+            auth_status="$(request_status "https://${fqdn}/api/v1/health")"
+            if [[ "$auth_status" == "401" ]] && grep --ignore-case --quiet '^www-authenticate:[[:space:]]*Bearer' "$headers_file"; then break; fi
+            sleep 5
+          done
+          if [[ "$auth_status" != "401" ]] || ! grep --ignore-case --quiet '^www-authenticate:[[:space:]]*Bearer' "$headers_file"; then
+            report_http_failure "Unauthenticated public /api/v1/health check (expected HTTP 401 with Bearer challenge)" "$auth_status"
+            exit 1
+          fi
+          echo "Unauthenticated /api/v1/health returned HTTP 401 with a Bearer challenge."
+          echo "Latest revision uses the exact SHA image and is healthy; public liveness, readiness, OpenAPI, and API authentication checks passed."

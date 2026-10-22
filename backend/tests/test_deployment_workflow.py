@@ -87,3 +87,23 @@ def test_workflow_submits_sanitized_live_container_payload_for_exact_target_and_
     assert '--uri "https://management.azure.com${app_id}?api-version=2025-07-01"' in deploy_step
     assert '--body "@$patch_json"' in deploy_step
     assert "imageType" not in deploy_step
+
+
+def test_workflow_waits_for_healthy_revision_then_checks_public_endpoints_separately():
+    deploy_start = WORKFLOW.index("- name: Deploy the exact pushed image and normalize the app container name")
+    deploy_step = WORKFLOW[deploy_start:]
+    revision_verified = deploy_step.index("verify_aca_deployment.py verify-revision")
+    health_probes_checked = deploy_step.index("for probe in live ready; do")
+    openapi_checked = deploy_step.index('"https://${fqdn}/openapi.json"')
+    api_auth_checked = deploy_step.index('"https://${fqdn}/api/v1/health"')
+
+    assert revision_verified < health_probes_checked < openapi_checked < api_auth_checked
+    assert 'request_status "https://${fqdn}/health/${probe}"' in deploy_step
+    assert 'expected_check="liveness"' in deploy_step
+    assert 'expected_check="readiness"' in deploy_step
+    assert "verify-health-response" in deploy_step
+    assert "verify-openapi-response" in deploy_step
+    assert "http-diagnostic" in deploy_step
+    assert "--connect-timeout 10 --max-time 15" in deploy_step
+    assert 'for attempt in $(seq 1 6)' in deploy_step
+    assert "Sanitized revision state" in deploy_step

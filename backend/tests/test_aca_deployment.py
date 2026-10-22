@@ -6,7 +6,10 @@ from scripts.verify_aca_deployment import (
     DeploymentValidationError,
     acr_pull_role,
     build_container_template_patch,
+    build_http_diagnostic,
     verify_pull_role,
+    verify_health_response,
+    verify_openapi_response,
     verify_registry_auth,
     verify_revision,
 )
@@ -172,3 +175,29 @@ def test_revision_requires_exact_image_and_healthy_running_state():
     bad["properties"]["healthState"] = "Unhealthy"
     with pytest.raises(DeploymentValidationError, match="not Healthy"):
         verify_revision(bad, "registry/rematch-api:sha")
+
+
+def test_http_diagnostic_reports_status_and_redacts_credentials():
+    diagnostic = build_http_diagnostic(
+        "401",
+        '{"detail":"Authorization: Bearer example-token","access_token":"example-secret"}',
+        "curl failed with password=example-password",
+    )
+
+    rendered = str(diagnostic)
+    assert diagnostic["httpStatus"] == "401"
+    assert "[REDACTED]" in rendered
+    assert "example-token" not in rendered
+    assert "example-secret" not in rendered
+    assert "example-password" not in rendered
+
+
+def test_public_health_and_openapi_response_contracts():
+    verify_health_response({"status": "ok", "check": "liveness"}, "liveness")
+    verify_health_response({"status": "ok", "check": "readiness"}, "readiness")
+    verify_openapi_response({"openapi": "3.1.0", "paths": {"/api/v1/health": {}}})
+
+    with pytest.raises(DeploymentValidationError, match="health response"):
+        verify_health_response({"status": "not_ready", "check": "readiness"}, "readiness")
+    with pytest.raises(DeploymentValidationError, match="valid OpenAPI"):
+        verify_openapi_response({"openapi": "3.1.0"})

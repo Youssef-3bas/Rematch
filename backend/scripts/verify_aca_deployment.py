@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -151,6 +152,52 @@ def verify_revision(document: dict[str, Any], image: str) -> None:
         raise DeploymentValidationError("Latest revision is not Provisioned yet.")
 
 
+_SENSITIVE_KEY = re.compile(r"token|secret|password|authorization|credential|cookie", re.IGNORECASE)
+_BEARER_VALUE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/-]+=*")
+_SENSITIVE_VALUE = re.compile(
+    r"(?i)([\"']?(?:access[_-]?token|api[_-]?bearer[_-]?token|password|secret|authorization|credential)[\"']?\s*[:=]\s*[\"']?)[^\s,;\"'<>]+"
+)
+
+
+def _sanitize_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if _SENSITIVE_KEY.search(str(key)) else _sanitize_diagnostic_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_diagnostic_value(item) for item in value]
+    if isinstance(value, str):
+        sanitized = _BEARER_VALUE.sub(r"\1[REDACTED]", value)
+        sanitized = _SENSITIVE_VALUE.sub(r"\1[REDACTED]", sanitized)
+        sanitized = " ".join("".join(ch for ch in sanitized if ch.isprintable()).split())
+        return sanitized[:400]
+    return value
+
+
+def build_http_diagnostic(status_code: str, body: str, request_error: str) -> dict[str, Any]:
+    """Build bounded, one-line HTTP diagnostics with credential redaction."""
+    try:
+        body_value: Any = json.loads(body) if body else None
+    except json.JSONDecodeError:
+        body_value = body or None
+    return {
+        "httpStatus": status_code or "000",
+        "requestError": _sanitize_diagnostic_value(request_error) or None,
+        "bodyPreview": _sanitize_diagnostic_value(body_value),
+    }
+
+
+def verify_health_response(document: Any, check: str) -> None:
+    if document != {"status": "ok", "check": check}:
+        raise DeploymentValidationError(f"The {check} health response did not match its expected contract.")
+
+
+def verify_openapi_response(document: Any) -> None:
+    if not isinstance(document, dict) or not isinstance(document.get("openapi"), str) or not isinstance(document.get("paths"), dict):
+        raise DeploymentValidationError("The public OpenAPI response is not a valid OpenAPI document.")
+
+
 def _read(path: str) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -174,6 +221,15 @@ def main() -> int:
     revision = subparsers.add_parser("verify-revision")
     revision.add_argument("input")
     revision.add_argument("--image", required=True)
+    http_diagnostic = subparsers.add_parser("http-diagnostic")
+    http_diagnostic.add_argument("status_code")
+    http_diagnostic.add_argument("body")
+    http_diagnostic.add_argument("request_error")
+    health_response = subparsers.add_parser("verify-health-response")
+    health_response.add_argument("input")
+    health_response.add_argument("--check", choices=("liveness", "readiness"), required=True)
+    openapi_response = subparsers.add_parser("verify-openapi-response")
+    openapi_response.add_argument("input")
     args = parser.parse_args()
 
     try:
@@ -188,6 +244,14 @@ def main() -> int:
             Path(args.output).write_text(json.dumps(patch_doc), encoding="utf-8")
         elif args.command == "verify-revision":
             verify_revision(_read(args.input), args.image)
+        elif args.command == "http-diagnostic":
+            body = Path(args.body).read_text(encoding="utf-8", errors="replace")
+            request_error = Path(args.request_error).read_text(encoding="utf-8", errors="replace")
+            print(json.dumps(build_http_diagnostic(args.status_code, body, request_error)))
+        elif args.command == "verify-health-response":
+            verify_health_response(_read(args.input), args.check)
+        elif args.command == "verify-openapi-response":
+            verify_openapi_response(_read(args.input))
     except (DeploymentValidationError, KeyError, TypeError, json.JSONDecodeError) as exc:
         print(f"Deployment validation failed: {exc}", file=sys.stderr)
         return 1
