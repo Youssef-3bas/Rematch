@@ -283,8 +283,35 @@ jobs:
             sleep 10
           done
           if [[ "$revision_ready" != true ]]; then
-            revision_state="$(az containerapp revision show --name rematch-api --resource-group Rematch-RG --revision "$latest_revision" --query '{name:name,healthState:properties.healthState,runningState:properties.runningState,provisioningState:properties.provisioningState,containers:properties.template.containers[].{name:name,image:image}}' --output json --only-show-errors 2>/dev/null || echo '{}')"
-            echo "::error::Latest revision did not become Healthy, Running, and Provisioned with the exact SHA image. Sanitized revision state: ${revision_state}"
+            replicas_json="$(mktemp)"
+            system_logs_json="$(mktemp)"
+            console_logs_json="$(mktemp)"
+            revision_error="$(mktemp)"
+            replica_error="$(mktemp)"
+            system_log_error="$(mktemp)"
+            console_log_error="$(mktemp)"
+            trap 'rm -f "$app_json" "$patch_json" "$update_error" "$response_file" "$headers_file" "$revision_json" "$replicas_json" "$system_logs_json" "$console_logs_json" "$revision_error" "$replica_error" "$system_log_error" "$console_log_error"' EXIT
+
+            if ! az containerapp revision show --name rematch-api --resource-group Rematch-RG --revision "$latest_revision" --output json --only-show-errors > "$revision_json" 2>"$revision_error"; then
+              printf '{}\n' > "$revision_json"
+            fi
+            if ! az containerapp replica list --name rematch-api --resource-group Rematch-RG --revision "$latest_revision" --output json --only-show-errors > "$replicas_json" 2>"$replica_error"; then
+              printf '{}\n' > "$replicas_json"
+            fi
+            if ! az containerapp logs show --name rematch-api --resource-group Rematch-RG --type system --revision "$latest_revision" --tail 50 --format json --output json --only-show-errors > "$system_logs_json" 2>"$system_log_error"; then
+              printf '{}\n' > "$system_logs_json"
+            fi
+            if ! az containerapp logs show --name rematch-api --resource-group Rematch-RG --type console --revision "$latest_revision" --container rematch-api --tail 50 --format json --output json --only-show-errors > "$console_logs_json" 2>"$console_log_error"; then
+              printf '{}\n' > "$console_logs_json"
+            fi
+            revision_diagnostic="$(python backend/scripts/verify_aca_deployment.py revision-diagnostic \
+              "$revision_json" "$replicas_json" "$system_logs_json" "$console_logs_json" \
+              --image "$IMAGE" \
+              --revision-error "$(cat "$revision_error")" \
+              --replica-error "$(cat "$replica_error")" \
+              --system-log-error "$(cat "$system_log_error")" \
+              --console-log-error "$(cat "$console_log_error")")"
+            echo "::error::Latest revision did not become Healthy, Running, and Provisioned with the exact SHA image. Revision failure diagnostics (sensitive values redacted): ${revision_diagnostic}"
             exit 1
           fi
           echo "Verified revision ${latest_revision}: healthy, running, provisioned, and using the expected SHA image."

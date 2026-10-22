@@ -152,10 +152,16 @@ def verify_revision(document: dict[str, Any], image: str) -> None:
         raise DeploymentValidationError("Latest revision is not Provisioned yet.")
 
 
-_SENSITIVE_KEY = re.compile(r"token|secret|password|authorization|credential|cookie", re.IGNORECASE)
+_SENSITIVE_KEY = re.compile(
+    r"token|secret|password|authorization|credential|cookie|api[_-]?key|\bsas\b|\bsig\b",
+    re.IGNORECASE,
+)
 _BEARER_VALUE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/-]+=*")
 _SENSITIVE_VALUE = re.compile(
-    r"(?i)([\"']?(?:access[_-]?token|api[_-]?bearer[_-]?token|password|secret|authorization|credential)[\"']?\s*[:=]\s*[\"']?)[^\s,;\"'<>]+"
+    r"(?i)([\"']?[\w.-]*(?:access[_-]?token|bearer[_-]?token|password|secret|authorization|credential|api[_-]?key|client[_-]?secret|sas|sig)[\w.-]*[\"']?\s*[:=]\s*[\"']?)[^\s,;\"'<>]+"
+)
+_FAILURE_LOG_MARKER = re.compile(
+    r"(?i)failed|failure|error|unhealthy|back.?off|denied|timed? out|timeout|probe|image.?pull|crash|exited|refused|not found|fatal|oom|killed"
 )
 
 
@@ -185,6 +191,106 @@ def build_http_diagnostic(status_code: str, body: str, request_error: str) -> di
         "httpStatus": status_code or "000",
         "requestError": _sanitize_diagnostic_value(request_error) or None,
         "bodyPreview": _sanitize_diagnostic_value(body_value),
+    }
+
+
+def _revision_containers(document: Any) -> list[dict[str, Any]]:
+    if not isinstance(document, dict):
+        return []
+    properties = _properties(document)
+    template = properties.get("template")
+    containers = template.get("containers") if isinstance(template, dict) else None
+    if not isinstance(containers, list):
+        return []
+    return [item for item in containers if isinstance(item, dict)]
+
+
+def _replica_items(document: Any) -> list[dict[str, Any]] | None:
+    if isinstance(document, list):
+        return [item for item in document if isinstance(item, dict)]
+    if isinstance(document, dict) and isinstance(document.get("value"), list):
+        return [item for item in document["value"] if isinstance(item, dict)]
+    return None
+
+
+def _diagnostic_log_lines(document: Any) -> list[str]:
+    """Return only sanitized, relevant error lines from Azure log output."""
+    messages: list[str] = []
+
+    def visit(value: Any, field: str = "") -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).casefold() in {"log", "log_s", "message", "reason", "error", "details", "exception", "output"}:
+                    visit(item, str(key))
+                elif isinstance(item, (dict, list)):
+                    visit(item, field)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item, field)
+        elif isinstance(value, str) and field:
+            for line in value.splitlines():
+                cleaned = _sanitize_diagnostic_value(line)
+                if cleaned and _FAILURE_LOG_MARKER.search(cleaned):
+                    messages.append(cleaned)
+
+    visit(document)
+    # Keep the report useful in GitHub annotations while bounding its size.
+    return messages[-12:]
+
+
+def build_revision_diagnostic(
+    revision: Any,
+    replicas: Any,
+    system_logs: Any,
+    console_logs: Any,
+    expected_image: str,
+    *,
+    revision_query_error: str = "",
+    replica_query_error: str = "",
+    system_log_query_error: str = "",
+    console_log_query_error: str = "",
+) -> dict[str, Any]:
+    """Build a bounded revision/replica failure report without exposing secrets."""
+    properties = _properties(revision) if isinstance(revision, dict) else {}
+    containers = _revision_containers(revision)
+    replica_items = _replica_items(replicas)
+
+    def sanitized_error(value: str) -> Any:
+        return _sanitize_diagnostic_value(value) or None
+
+    return {
+        "revisionName": _sanitize_diagnostic_value(revision.get("name")) if isinstance(revision, dict) else None,
+        "expectedImage": _sanitize_diagnostic_value(expected_image),
+        "containers": [
+            {
+                "name": _sanitize_diagnostic_value(item.get("name")),
+                "image": _sanitize_diagnostic_value(item.get("image")),
+            }
+            for item in containers
+        ],
+        "provisioningState": properties.get("provisioningState"),
+        "runningState": properties.get("runningState"),
+        "healthState": properties.get("healthState"),
+        "runningStateDetails": _sanitize_diagnostic_value(properties.get("runningStateDetails")),
+        "provisioningError": _sanitize_diagnostic_value(properties.get("provisioningError")),
+        "replicaCount": len(replica_items) if replica_items is not None else None,
+        "replicas": [
+            {
+                "name": _sanitize_diagnostic_value(item.get("name")),
+                "runningState": _sanitize_diagnostic_value(
+                    item.get("runningState") or (item.get("properties") or {}).get("runningState")
+                    if isinstance(item.get("properties"), dict) or item.get("runningState")
+                    else None
+                ),
+            }
+            for item in (replica_items or [])[:10]
+        ],
+        "revisionQueryError": sanitized_error(revision_query_error),
+        "replicaQueryError": sanitized_error(replica_query_error),
+        "systemLogQueryError": sanitized_error(system_log_query_error),
+        "consoleLogQueryError": sanitized_error(console_log_query_error),
+        "systemFailureLogs": _diagnostic_log_lines(system_logs),
+        "consoleFailureLogs": _diagnostic_log_lines(console_logs),
     }
 
 
@@ -225,6 +331,16 @@ def main() -> int:
     http_diagnostic.add_argument("status_code")
     http_diagnostic.add_argument("body")
     http_diagnostic.add_argument("request_error")
+    revision_diagnostic = subparsers.add_parser("revision-diagnostic")
+    revision_diagnostic.add_argument("revision")
+    revision_diagnostic.add_argument("replicas")
+    revision_diagnostic.add_argument("system_logs")
+    revision_diagnostic.add_argument("console_logs")
+    revision_diagnostic.add_argument("--image", required=True)
+    revision_diagnostic.add_argument("--revision-error", default="")
+    revision_diagnostic.add_argument("--replica-error", default="")
+    revision_diagnostic.add_argument("--system-log-error", default="")
+    revision_diagnostic.add_argument("--console-log-error", default="")
     health_response = subparsers.add_parser("verify-health-response")
     health_response.add_argument("input")
     health_response.add_argument("--check", choices=("liveness", "readiness"), required=True)
@@ -248,6 +364,19 @@ def main() -> int:
             body = Path(args.body).read_text(encoding="utf-8", errors="replace")
             request_error = Path(args.request_error).read_text(encoding="utf-8", errors="replace")
             print(json.dumps(build_http_diagnostic(args.status_code, body, request_error)))
+        elif args.command == "revision-diagnostic":
+            diagnostic = build_revision_diagnostic(
+                _read(args.revision),
+                _read(args.replicas),
+                _read(args.system_logs),
+                _read(args.console_logs),
+                args.image,
+                revision_query_error=args.revision_error,
+                replica_query_error=args.replica_error,
+                system_log_query_error=args.system_log_error,
+                console_log_query_error=args.console_log_error,
+            )
+            print(json.dumps(diagnostic))
         elif args.command == "verify-health-response":
             verify_health_response(_read(args.input), args.check)
         elif args.command == "verify-openapi-response":
